@@ -1,0 +1,10 @@
+{
+    "files.associations": {
+        "esp_wifi.h": "c",
+        "esp_netif.h": "c",
+        "protocol_examples_common.h": "c"
+    },
+    "idf.adapterTargetName": "esp32",
+    "idf.port": "/dev/cu.usbserial-0001",
+    "idf.flashType": "UART"
+}
