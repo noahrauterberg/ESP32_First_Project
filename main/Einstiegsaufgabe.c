@@ -15,7 +15,7 @@
 static EventGroupHandle_t wifi_event_group;
 
 char wifi_ssid[32];
-char wifi_password[32];
+char wifi_password[64];
 
 void http_event_handler(esp_http_client_event_handle_t event) {
     switch (event->event_id) {
@@ -48,7 +48,7 @@ void wifi_event_handler(void *event_handler_arg, esp_event_base_t event_base, in
             for (int i=0; i<10; i++) {
                 esp_err_t err = esp_wifi_connect();
                 if (err == ESP_OK) {
-                    printf("Connected to wifi!\n");
+                    printf("Connected to wifi! - after disconnect\n");
                     return;
                 }
             }
@@ -88,13 +88,12 @@ void connect_to_wifi() {
 
     // Configuration Phase
     esp_wifi_set_mode(WIFI_MODE_STA);
-    wifi_config_t config = {
-        .sta = {
-            .ssid = {wifi_ssid},
-            .password = {wifi_password},
-            .scan_method = WIFI_FAST_SCAN
-        }
-    };
+    wifi_config_t config = {0};
+    
+    // workaround because of some weird error
+    memcpy(config.sta.ssid, wifi_ssid, strlen(wifi_ssid));
+    memcpy(config.sta.password, wifi_password, strlen(wifi_password));
+
     esp_wifi_set_config(WIFI_IF_STA, &config);
 
     // Start/Connect Phase
