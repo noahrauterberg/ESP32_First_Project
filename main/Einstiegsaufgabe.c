@@ -4,18 +4,18 @@
 #include "nvs_flash.h"
 #include "esp_log.h"
 #include "freertos/event_groups.h"
-
 #include "esp_http_client.h"
 
-static EventGroupHandle_t wifi_event_group;
-
-#define WIFI_GOT_IP_BIT BIT0
-
-#define WIFI_SSID CONFIG_ESP_WIFI_SSID
-#define WIFI_PASS CONFIG_ESP_WIFI_PASSWORD
+#define WIFI_READ_INFO BIT0
+#define WIFI_GOT_IP_BIT BIT1
 
 #define POST_URL "https://europe-west3-einstiegsaufgabe.cloudfunctions.net/receive_data"
 #define POST_PORT 80
+
+static EventGroupHandle_t wifi_event_group;
+
+char wifi_ssid[32];
+char wifi_password[32];
 
 void http_event_handler(esp_http_client_event_handle_t event) {
     switch (event->event_id) {
@@ -43,7 +43,7 @@ void wifi_event_handler(void *event_handler_arg, esp_event_base_t event_base, in
             break;
         case WIFI_EVENT_STA_DISCONNECTED:
             wifi_event_sta_disconnected_t* event = (wifi_event_sta_disconnected_t*) event_data;
-            printf("Lost connection/unable to find wifi, reason %d\n", event->reason, event->reason);
+            printf("Lost connection/unable to find wifi, reason %d\n", event->reason);
             xEventGroupClearBits(wifi_event_group, WIFI_GOT_IP_BIT);
             for (int i=0; i<10; i++) {
                 esp_err_t err = esp_wifi_connect();
@@ -90,9 +90,9 @@ void connect_to_wifi() {
     esp_wifi_set_mode(WIFI_MODE_STA);
     wifi_config_t config = {
         .sta = {
-        .ssid = WIFI_SSID,
-        .password = WIFI_PASS,
-        .scan_method = WIFI_FAST_SCAN
+            .ssid = {wifi_ssid},
+            .password = {wifi_password},
+            .scan_method = WIFI_FAST_SCAN
         }
     };
     esp_wifi_set_config(WIFI_IF_STA, &config);
@@ -145,6 +145,64 @@ void post_http() {
     esp_http_client_cleanup(client);
 }
 
+// reading wifi ssid and password
+void read_wifi() {
+    nvs_handle_t wifi_handle;
+    esp_err_t err = nvs_open("wifi_storage", NVS_READWRITE, &wifi_handle);
+    if (err != ESP_OK) {
+        printf("Error opening storage: %s \n", esp_err_to_name(err));
+        nvs_close(wifi_handle);
+        return;
+    } 
+    size_t ssid_size = sizeof(wifi_ssid);
+    err = nvs_get_str(wifi_handle, "ssid", wifi_ssid, &ssid_size);
+    if (err != ESP_OK) {
+        printf("Error getting ssid: %s \n", esp_err_to_name(err));
+        nvs_close(wifi_handle);
+        return;
+    } 
+    printf("read wifi_ssid: %s\n", wifi_ssid);
+
+    size_t password_size = sizeof(wifi_password);
+    err = nvs_get_str(wifi_handle, "password", wifi_password, &password_size);
+    if (err != ESP_OK) {
+        printf("Error getting password: %s \n", esp_err_to_name(err));
+        nvs_close(wifi_handle);
+        return;
+    }
+    printf("read wifi_password: %s\n", wifi_password);
+
+    // set event bit
+    xEventGroupSetBits(wifi_event_group, WIFI_READ_INFO);
+
+    nvs_close(wifi_handle);
+}
+
+void write_wifi(char* ssid, char* password) {
+    nvs_handle_t wifi_handle;
+    esp_err_t err = nvs_open("wifi_storage", NVS_READWRITE, &wifi_handle);
+    if (err != ESP_OK) {
+        printf("Error opening storage: %s \n", esp_err_to_name(err));
+        return;
+    }
+
+    err = nvs_set_str(wifi_handle, "ssid", ssid);
+    if (err != ESP_OK) {
+        printf("Error writing ssid: %s \n", esp_err_to_name(err));
+        nvs_close(wifi_handle);
+        return;
+    }
+    err = nvs_set_str(wifi_handle, "password", password);
+    if (err != ESP_OK) {
+        printf("Error writing password: %s \n", esp_err_to_name(err));
+        nvs_close(wifi_handle);
+        return;
+    }
+
+    nvs_commit(wifi_handle);
+    nvs_close(wifi_handle);
+}
+
 void app_main(void) {
     // copy-paste from station_example_main.c
     // Initialize NVS
@@ -156,6 +214,18 @@ void app_main(void) {
     ESP_ERROR_CHECK(err);
 
     wifi_event_group = xEventGroupCreate();
+    read_wifi();
+
+    EventBits_t wifi_bits = xEventGroupGetBits(wifi_event_group);
+    if (!(wifi_bits & WIFI_READ_INFO)) {
+        // reading didn't work, we try once more
+        read_wifi();
+        if (!(wifi_bits & WIFI_READ_INFO)) {
+            printf("unable to read wifi information %s - %s\n", wifi_ssid, wifi_password);
+            return;
+        }
+    }
+
     connect_to_wifi();
     
     xEventGroupWaitBits(wifi_event_group, WIFI_GOT_IP_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
