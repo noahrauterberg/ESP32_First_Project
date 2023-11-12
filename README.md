@@ -16,5 +16,6 @@ The ESP32 offers four Bluetooth services:
 ---
 ## ToDo:
 - [ ] Handle incorrect WiFi information
+- [ ] Handle Bluetooth incoming connection correctly
 - [ ] Option to disconnect from WiFi
 - [ ] Process POST request on gcp
