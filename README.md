@@ -1,6 +1,8 @@
 # ESP32_First_Project
 A small test project to get familiar with the ESP32
+
 Part of the "Programmierpraktikum Verteilte Systeme" at TU Berlin
+
 ---
 ## Project Description
 The ESP32 can be used to connect to wifi and send a HTTP POST request to a gcp cloud function and can be customized via Bluetooth. 
