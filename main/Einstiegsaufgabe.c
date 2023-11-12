@@ -19,17 +19,53 @@
 #define POST_URL "https://europe-west3-einstiegsaufgabe.cloudfunctions.net/receive_data"
 #define POST_PORT 80
 
-#define BLUETOOTH_NAME "esp32"
-#define GATTS_SERVICE_UUID 0xFF
+#define BLUETOOTH_NAME "esp32-noah"
+// every service requests the following handles: service, char, char value, char desc
+#define GATTS_NUM_HANDLES 4
+#define NUM_SERVICES 4
 #define PREPARE_BUF_MAX_SIZE 1024
+#define MAX_WRITE_LENGTH 1024
+
+#define SSID_SERVICE_ID 0
+#define SERVICE_UUID_SSID 0x0AA
+#define SERVICE_CHAR_UUID_SSID 0xAA01
+#define SERVICE_DESC_UUID_SSID 0x1111
+
+#define PASS_SERVICE_ID 1
+#define SERVICE_UUID_PASS 0x0BB
+#define SERVICE_CHAR_UUID_PASS 0xBB01
+#define SERVICE_DESC_UUID_PASS 0x2222
+
+#define MSG_SERVICE_ID 2
+#define SERVICE_UUID_MSG 0x0CC
+#define SERVICE_CHAR_UUID_MSG 0xCC01
+#define SERVICE_DESC_UUID_MSG 0x3333
+
+#define CONN_SERVICE_ID 3
+#define SERVICE_UUID_CONN 0x0DD
+#define SERVICE_CHAR_UUID_CONN 0xDD01
+#define SERVICE_DESC_UUID_CONN 0x4444
+
+void write_wifi_ssid(uint8_t* msg, uint16_t len);
+void write_wifi_password(uint8_t* msg, uint16_t len);
+void post_http();
+void connect_to_wifi();
+void read_wifi();
 
 static EventGroupHandle_t wifi_event_group;
 
 char wifi_ssid[32];
 char wifi_password[64];
 
+char post_message[128] = "default";
+
 // COPY-PASTE examples/bluedroid/ble/gatt_server/main.c
 struct gatts_profile_inst {
+    int service_uuid;
+    int service_char_uuid;
+    int service_desc_uuid;
+    // added above
+    uint16_t gatts_if;
     uint16_t app_id;
     uint16_t conn_id;
     uint16_t service_handle;
@@ -85,8 +121,6 @@ static esp_ble_adv_params_t adv_params = {
     .adv_int_max        = 0x40,
     .adv_type           = ADV_TYPE_IND,
     .own_addr_type      = BLE_ADDR_TYPE_PUBLIC,
-    //.peer_addr            =
-    //.peer_addr_type       =
     .channel_map        = ADV_CHNL_ALL,
     .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
 };
@@ -96,6 +130,33 @@ typedef struct {
 } prepare_type_env_t;
 // End Copy-Paste
 
+static struct gatts_profile_inst services_array[NUM_SERVICES] = {
+    [SSID_SERVICE_ID] = {
+        .gatts_if = ESP_GATT_IF_NONE,
+        .service_uuid = SERVICE_UUID_SSID,
+        .service_char_uuid = SERVICE_CHAR_UUID_SSID,
+        .service_desc_uuid = SERVICE_DESC_UUID_SSID,
+    },
+    [PASS_SERVICE_ID] = {
+        .gatts_if = ESP_GATT_IF_NONE,
+        .service_uuid = SERVICE_UUID_PASS,
+        .service_char_uuid = SERVICE_CHAR_UUID_PASS,
+        .service_desc_uuid = SERVICE_DESC_UUID_PASS,
+    },
+    [MSG_SERVICE_ID] = {
+        .gatts_if = ESP_GATT_IF_NONE,
+        .service_uuid = SERVICE_UUID_MSG,
+        .service_char_uuid = SERVICE_CHAR_UUID_MSG,
+        .service_desc_uuid = SERVICE_DESC_UUID_MSG,
+    },
+    [CONN_SERVICE_ID] = {
+        .gatts_if = ESP_GATT_IF_NONE,
+        .service_uuid = SERVICE_UUID_CONN,
+        .service_char_uuid = SERVICE_CHAR_UUID_CONN,
+        .service_desc_uuid = SERVICE_DESC_UUID_CONN,
+    }
+};
+
 static uint8_t attr_val[] = {0x11, 0x22, 0x33};
 static esp_attr_value_t service_char_value = {
     .attr_max_len = 64,
@@ -103,14 +164,23 @@ static esp_attr_value_t service_char_value = {
     .attr_len = sizeof(attr_val)
 };
 
-static struct gatts_profile_inst bt_profile = {};
 static prepare_type_env_t write_prep_env;
+
+void write_post_message(uint8_t* msg, uint16_t len) {
+    if (len >= 128) {
+        printf("Couldn't write post_message\n");
+        return;
+    }
+    post_message[len] = '\0';
+    memcpy(post_message, msg, len);
+    printf("New post_message: %s\n", post_message);
+}
 
 void print_uint8_as_char(uint8_t* msg, uint16_t len) {
     char str[len + 1];
     str[len] = '\0';
     memcpy(str, msg, len);
-    printf("got %s\n", str);
+    printf("Message received: %s\n", str);
 }
 
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
@@ -132,41 +202,65 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
     }
 }
 
-static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param) {
+// Register given service (called on ESP_GATTS_REG_EVT)
+static void register_service(uint8_t id) {
+    printf("Registering service with id %d\n", id);
+    services_array[id].service_id.is_primary = true;
+    services_array[id].service_id.id.inst_id = 0x00;
+    services_array[id].service_id.id.uuid.len = ESP_UUID_LEN_16;
+    services_array[id].service_id.id.uuid.uuid.uuid16 = services_array[id].service_uuid;
+}
+
+// Start given service (called on ESP_GATTS_CREATE_EVT)
+static void start_service(uint8_t id, esp_ble_gatts_cb_param_t* param) {
+    services_array[id].service_handle = param -> create.service_handle;
+    services_array[id].char_uuid.len = ESP_UUID_LEN_16;
+    services_array[id].char_uuid.uuid.uuid16 = services_array[id].service_char_uuid;
+
+    // start service
+    esp_ble_gatts_start_service(services_array[id].service_handle);
+    esp_gatt_char_prop_t service_properties = ESP_GATT_CHAR_PROP_BIT_WRITE;
+    esp_ble_gatts_add_char(services_array[id].service_handle, &services_array[id].char_uuid, ESP_GATT_PERM_WRITE, service_properties, &service_char_value, ESP_GATT_RSP_BY_APP);
+    esp_ble_gatts_add_char_descr(services_array[id].service_handle, &services_array[id].descr_uuid, ESP_GATT_PERM_WRITE, NULL, NULL);
+}
+
+// Add characteristics to given service (called on ESP_GATTS_ADD_CHAR_EVT)
+static void add_characteristic(uint8_t id, esp_ble_gatts_cb_param_t* param) {
+    services_array[id].char_handle = param -> add_char.attr_handle;
+    services_array[id].descr_uuid.len = ESP_UUID_LEN_16;
+    services_array[id].descr_uuid.uuid.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG;
+
+    esp_ble_gatts_add_char_descr(services_array[id].service_handle, &services_array[id].descr_uuid, ESP_GATT_PERM_WRITE, NULL, NULL);
+}
+
+static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t* param) {
     switch (event) {
+        // TODO: in what case would gatts_if == ESP_GATT_IF_NONE ?
         case ESP_GATTS_REG_EVT:
-            bt_profile.service_id.is_primary = true;
-            bt_profile.service_id.id.inst_id = 0x00;
-            bt_profile.service_id.id.uuid.len = ESP_UUID_LEN_16;
-            bt_profile.service_id.id.uuid.uuid.uuid16 = GATTS_SERVICE_UUID;
+            services_array[param->reg.app_id].gatts_if = gatts_if;
+            register_service(param->reg.app_id);
 
             esp_ble_gap_set_device_name(BLUETOOTH_NAME);
-
             esp_ble_gap_config_adv_data(&adv_data);
             // ?
             esp_ble_gap_config_adv_data(&scan_rsp_data);
-            esp_ble_gatts_create_service(gatts_if, &bt_profile.service_id, 4);
+            esp_ble_gatts_create_service(gatts_if, &services_array[param->reg.app_id].service_id, GATTS_NUM_HANDLES);
             break;
         case ESP_GATTS_CREATE_EVT:
-            bt_profile.service_handle = param -> create.service_handle;
-            bt_profile.char_uuid.len = ESP_UUID_LEN_16;
-            bt_profile.char_uuid.uuid.uuid16 = GATTS_SERVICE_UUID;
-
-            // start service
-            esp_ble_gatts_start_service(bt_profile.service_handle);
-            esp_gatt_char_prop_t service_properties = ESP_GATT_CHAR_PROP_BIT_WRITE;
-            esp_ble_gatts_add_char(bt_profile.service_handle, &bt_profile.char_uuid, ESP_GATT_PERM_WRITE, service_properties,&service_char_value, ESP_GATT_RSP_BY_APP);
-            esp_ble_gatts_add_char_descr(bt_profile.service_handle, &bt_profile.descr_uuid, ESP_GATT_PERM_WRITE, NULL, NULL);
+            for (int i=0; i<NUM_SERVICES; i++) {
+                if (services_array[i].gatts_if == gatts_if) {
+                    start_service(i, param);
+                    break;
+                }
+            }
             break;
         case ESP_GATTS_ADD_CHAR_EVT:
-            bt_profile.char_handle = param -> add_char.attr_handle;
-            bt_profile.descr_uuid.len = ESP_UUID_LEN_16;
-            bt_profile.descr_uuid.uuid.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG;
-            
-            int char_len = 0;
-            uint8_t* char_val;
-            esp_ble_gatts_get_attr_value(bt_profile.char_handle, &char_len, &char_val);
-
+            for (int i=0; i<NUM_SERVICES; i++) {
+                if (services_array[i].gatts_if == gatts_if) {
+                    add_characteristic(i, param);
+                    break;
+                }
+            }
             break;
         case ESP_GATTS_CONNECT_EVT:
             printf("Device connected \n");
@@ -177,7 +271,9 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
             conn_params.min_int = 0x10;
             conn_params.max_int = 0x20;
             conn_params.timeout = 400;
-            bt_profile.conn_id = param -> connect.conn_id;
+            for (int i=0; i<NUM_SERVICES; i++) {
+                services_array[i].conn_id = param -> connect.conn_id;
+            }
             esp_ble_gap_update_conn_params(&conn_params);
             break;
         case ESP_GATTS_DISCONNECT_EVT:
@@ -187,14 +283,26 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
             break;
         case ESP_GATTS_WRITE_EVT:
             print_uint8_as_char(param->write.value, param->write.len);
+            // first, we perform the action depending on the service, then we respond (or don't)
+            if (gatts_if == services_array[SSID_SERVICE_ID].gatts_if) {
+                write_wifi_ssid(param->write.value, param->write.len);
+            } else if (gatts_if == services_array[PASS_SERVICE_ID].gatts_if) {
+                write_wifi_password(param->write.value, param->write.len);
+            } else if (gatts_if == services_array[CONN_SERVICE_ID].gatts_if) {
+                connect_to_wifi();
+            } else if (gatts_if == services_array[MSG_SERVICE_ID].gatts_if) {
+                EventBits_t wifi_bits = xEventGroupGetBits(wifi_event_group);
+                if (!(wifi_bits & WIFI_GOT_IP_BIT)) {
+                    connect_to_wifi();
+                }
+                write_post_message(param->write.value, param->write.len);
+                xEventGroupWaitBits(wifi_event_group, WIFI_GOT_IP_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
+                post_http();
+            }
+
             if (!param->write.need_rsp) {
                 // if no response i needed, we do not respond
                 printf("No response needed\n");
-                // converting uint8_t to str/char[]
-                char msg[param->write.len + 1];
-                msg[param->write.len] = '\0';
-                memcpy(msg, param->write.value, param->write.len);
-                printf("got %s\n", msg);
                 break;
             }
             // Client needs a response
@@ -202,6 +310,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
             if (!param->write.is_prep) {
                 /* only need to handle write prep seperately, this doubles one line of code, 
                 * but keeps it unnested*/
+                printf("no prepare write\n");
                 esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, ESP_GATT_OK, NULL);
                 break;
             }
@@ -237,7 +346,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
             write_prep_env.prepare_len += param->write.len;
             break;
         case ESP_GATTS_EXEC_WRITE_EVT:
-            printf("exec write event\n");
+            printf("Unhandled exec write event\n");
             break;
         default:
             break;
@@ -275,7 +384,7 @@ static void wifi_event_handler(void *event_handler_arg, esp_event_base_t event_b
             for (int i=0; i<10; i++) {
                 esp_err_t err = esp_wifi_connect();
                 if (err == ESP_OK) {
-                    printf("Connected to wifi! - after disconnect\n");
+                    printf("Connecting to wifi! - after disconnect\n");
                     return;
                 }
             }
@@ -290,8 +399,8 @@ static void wifi_event_handler(void *event_handler_arg, esp_event_base_t event_b
     }
 }
 
-// Establishe a WIFI-Connection
-void connect_to_wifi() {
+// Start the wifi module
+void start_wifi() {
     // Initialization Phase
     esp_err_t err = esp_netif_init();
     if (err != ESP_OK) {
@@ -314,8 +423,12 @@ void connect_to_wifi() {
 
     // Configuration Phase
     esp_wifi_set_mode(WIFI_MODE_STA);
+}
+
+void connect_to_wifi() {
+    read_wifi();
+    xEventGroupWaitBits(wifi_event_group, WIFI_READ_INFO, pdFALSE, pdFALSE, portMAX_DELAY);
     wifi_config_t config = {0};
-    
     // workaround because of some weird error
     memcpy(config.sta.ssid, wifi_ssid, strlen(wifi_ssid));
     memcpy(config.sta.password, wifi_password, strlen(wifi_password));
@@ -323,7 +436,7 @@ void connect_to_wifi() {
     esp_wifi_set_config(WIFI_IF_STA, &config);
 
     // Start/Connect Phase
-    err = esp_wifi_start();
+    esp_err_t err = esp_wifi_start();
     if (err != ESP_OK) {
         printf("Some error occured whilst starting: %s\n", esp_err_to_name(err));
         return;
@@ -334,15 +447,6 @@ void connect_to_wifi() {
         return;
     }
 }
-
-/*
-void get_http() {
-    printf("getting http\n");
-    esp_http_client_config_t get_config = {
-        .url = POST_URL
-    };
-}
-*/
 
 // Post HTTP request to POST_URL and initialize http_event_handler
 void post_http() {
@@ -359,10 +463,10 @@ void post_http() {
         printf("Error during client-creation\n");
     }
 
-    char* message = "{\"message\":\"hello, gcp\"}";
-    esp_http_client_set_post_field(client, message, strlen(message));
-    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, post_message, strlen(post_message));
+    esp_http_client_set_header(client, "Content-Type", "plain/text");
 
+    printf("posting...\n");
     esp_err_t err = esp_http_client_perform(client);
     if (err != ESP_OK) {
         printf("Post failed: %s\n", esp_err_to_name(err));
@@ -405,8 +509,8 @@ void read_wifi() {
     nvs_close(wifi_handle);
 }
 
-// Write wifi ssid and password to nvs
-void write_wifi(char* ssid, char* password) {
+// Write wifi ssid to nvs
+void write_wifi_ssid(uint8_t* msg, uint16_t len) {
     nvs_handle_t wifi_handle;
     esp_err_t err = nvs_open("wifi_storage", NVS_READWRITE, &wifi_handle);
     if (err != ESP_OK) {
@@ -414,12 +518,34 @@ void write_wifi(char* ssid, char* password) {
         return;
     }
 
+    char ssid[len + 1];
+    ssid[len] = '\0';
+    memcpy(ssid, msg, len);
+
     err = nvs_set_str(wifi_handle, "ssid", ssid);
     if (err != ESP_OK) {
         printf("Error writing ssid: %s \n", esp_err_to_name(err));
         nvs_close(wifi_handle);
         return;
     }
+
+    nvs_commit(wifi_handle);
+    nvs_close(wifi_handle);
+}
+
+// Write wifi password to nvs
+void write_wifi_password(uint8_t* msg, uint16_t len) {
+    nvs_handle_t wifi_handle;
+    esp_err_t err = nvs_open("wifi_storage", NVS_READWRITE, &wifi_handle);
+    if (err != ESP_OK) {
+        printf("Error opening storage: %s \n", esp_err_to_name(err));
+        return;
+    }
+
+    char password[len + 1];
+    password[len] = '\0';
+    memcpy(password, msg, len);
+
     err = nvs_set_str(wifi_handle, "password", password);
     if (err != ESP_OK) {
         printf("Error writing password: %s \n", esp_err_to_name(err));
@@ -453,7 +579,10 @@ void start_bluetooth() {
     err = esp_ble_gap_register_callback(gap_event_handler);
 
     // Application Profile(s)
-    esp_ble_gatts_app_register(0);
+    esp_ble_gatts_app_register(SSID_SERVICE_ID);
+    esp_ble_gatts_app_register(PASS_SERVICE_ID);
+    esp_ble_gatts_app_register(MSG_SERVICE_ID);
+    esp_ble_gatts_app_register(CONN_SERVICE_ID);
 
     // ?
     esp_ble_gatt_set_local_mtu(500);
@@ -469,27 +598,7 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(err);
 
-    start_bluetooth();
-
     wifi_event_group = xEventGroupCreate();
-    /*
-    read_wifi();
-
-    EventBits_t wifi_bits = xEventGroupGetBits(wifi_event_group);
-    if (!(wifi_bits & WIFI_READ_INFO)) {
-        // reading didn't work, we try once more
-        read_wifi();
-        if (!(wifi_bits & WIFI_READ_INFO)) {
-            printf("unable to read wifi information %s - %s\n", wifi_ssid, wifi_password);
-            return;
-        }
-    }
-
-    connect_to_wifi();
-    
-    xEventGroupWaitBits(wifi_event_group, WIFI_GOT_IP_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
-    post_http();
-    */
-
-    printf("finished\n");
+    start_wifi();
+    start_bluetooth();
 }
